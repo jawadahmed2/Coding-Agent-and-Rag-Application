@@ -1,6 +1,6 @@
 # Agentic Rag Application
 
-This project provides a solution for parsing tabular data from PDFs and retrieve a relevant details. While it does not currently use a Large Language Model (LLM) for re-ranking, incorporating an LLM could significantly enhance the application's performance in terms of improving the quality of output data.
+This project provides a solution for parsing tabular data from PDFs and retrieve a relevant content.
 
 ## Features
 

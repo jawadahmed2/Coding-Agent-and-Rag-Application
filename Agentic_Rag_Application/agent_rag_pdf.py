@@ -1,122 +1,126 @@
 import os
-import sys
-from typing import List
-import asyncio
-from llama_index import VectorStoreIndex, ServiceContext
-from llama_index.node_parser import SimpleNodeParser
-from llama_index.embeddings import OpenAIEmbedding
-from llama_index.postprocessor import MetadataReplacementPostProcessor, SimilarityPostprocessor
-from llama_index.indices.postprocessor import SentenceTransformerRerank
-from llama_index.query_engine import RetrieverQueryEngine
-from llama_index.schema import Document
-from dotenv import load_dotenv
-import PyPDF2
-import camelot
+from typing import List, Dict
+from llama_index.core import VectorStoreIndex, Document, ServiceContext
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.core import Settings
+import chromadb
+import pandas as pd
+import tabula
+from config import AppConfig
+import fitz
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Load environment variables
-load_dotenv()
+embed_model_name = AppConfig.EMBEDDING_MODEL()[0]
+Settings.llm = None  # Disable LLM for this application
 
-async def parse_pdf(file_path: str) -> str:
-    """Parse a PDF file and return its content as a string."""
-    content = ""
+def get_service_context():
+    embed_model = HuggingFaceEmbedding(model_name=embed_model_name)
+    node_parser = SimpleNodeParser.from_defaults(
+        chunk_size=2000,  # Increased to capture more context
+        chunk_overlap=400
+    )
+    return ServiceContext.from_defaults(
+        llm=None,
+        embed_model=embed_model,
+        node_parser=node_parser
+    )
 
-    # Extract text using PyPDF2
-    with open(file_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        for page in reader.pages:
-            content += page.extract_text() + "\n"
+def extract_tables_from_pdf(file_path: str) -> List[pd.DataFrame]:
+    return tabula.read_pdf(file_path, pages='all', multiple_tables=True)
 
-    # Extract tables using Camelot
-    tables = camelot.read_pdf(file_path)
-    for table in tables:
-        content += table.df.to_string(index=False) + "\n\n"
+def process_tables(tables: List[pd.DataFrame]) -> str:
+    return "\n\n".join(table.to_string(index=False) for table in tables)
 
-    return content
+def clean_text(text: str) -> str:
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 async def ingest_pdfs(directory: str) -> VectorStoreIndex:
-    """Ingest PDFs from a directory and create a VectorStoreIndex."""
     pdf_files = [f for f in os.listdir(directory) if f.endswith('.pdf')]
 
     documents = []
     for pdf_file in pdf_files:
         file_path = os.path.join(directory, pdf_file)
-        content = await parse_pdf(file_path)
-        documents.append(Document(text=content))
 
-    # Create a custom ServiceContext
-    embed_model = OpenAIEmbedding()
-    service_context = ServiceContext.from_defaults(
-        llm=None,
-        embed_model=embed_model,
-        node_parser=SimpleNodeParser.from_defaults()
-    )
+        tables = extract_tables_from_pdf(file_path)
+        table_content = process_tables(tables)
 
-    # Create and return the index
-    return VectorStoreIndex.from_documents(
-        documents,
+        with fitz.open(file_path) as doc:
+            text_content = ""
+            for page in doc:
+                text_content += clean_text(page.get_text())
+
+        combined_content = f"{text_content}\n\n{table_content}"
+        documents.append(Document(text=combined_content, metadata={"source": pdf_file}))
+
+    chroma_client = chromadb.Client()
+    collection = chroma_client.create_collection(name="pdf_docs")
+
+    for i, doc in enumerate(documents):
+        collection.add(
+            ids=[str(i)],
+            documents=[doc.text],
+            metadatas=[{"source": doc.metadata["source"]}],
+        )
+
+    print(f"Added {len(documents)} documents to the collection.")
+
+    vector_store = ChromaVectorStore(collection)
+    service_context = get_service_context()
+
+    return VectorStoreIndex.from_vector_store(
+        vector_store=vector_store,
         service_context=service_context
     )
 
-class RAGQueryEngine:
-    def __init__(self, vector_store):
-        self.vector_store = vector_store
+def get_most_relevant_chunk_with_context(text: str, query: str, context_size: int = 300) -> str:
+    words = text.split()
+    chunks = []
+    current_chunk = []
 
-    async def retrieve_nodes(self) -> RetrieverQueryEngine:
-        embedding_model = OpenAIEmbedding()
-        service_context = ServiceContext.from_defaults(
-            llm=None,
-            embed_model=embedding_model
-        )
-        index = VectorStoreIndex.from_vector_store(
-            self.vector_store,
-            service_context=service_context
-        )
-        postproc = MetadataReplacementPostProcessor(
-            target_metadata_key="window"
-        )
-        rerank = SentenceTransformerRerank(
-            top_n=5,
-            model="BAAI/bge-reranker-base"
-        )
-        score = SimilarityPostprocessor(similarity_cutoff=0.60)
-        query_engine = index.as_query_engine(
-            similarity_top_k=10,
-            alpha=0.5,
-            node_postprocessors=[postproc, rerank, score],
-        )
-        return query_engine
+    for i, word in enumerate(words):
+        current_chunk.append(word)
+        if i % 50 == 0 and i > 0:  # Create overlapping chunks of ~50 words
+            chunks.append(' '.join(current_chunk))
+            current_chunk = current_chunk[-10:]  # Keep last 10 words for overlap
 
-async def query_index(index: VectorStoreIndex, query: str) -> str:
-    """Query the index and return the result."""
-    rag_engine = RAGQueryEngine(index.vector_store)
-    query_engine = await rag_engine.retrieve_nodes()
-    response = await query_engine.aquery(query)
-    return str(response)
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
 
-async def main():
-    print("Welcome to the RAG-based Tabular PDF Ingestion Application!")
+    vectorizer = TfidfVectorizer()
+    chunk_vectors = vectorizer.fit_transform(chunks)
+    query_vector = vectorizer.transform([query])
 
-    # Get the directory path from the user
-    pdf_directory = input("Enter the path to the directory containing PDF files: ")
+    similarities = cosine_similarity(query_vector, chunk_vectors)
+    most_relevant_chunk_index = similarities.argmax()
 
-    if not os.path.isdir(pdf_directory):
-        print("Error: The specified directory does not exist.")
-        sys.exit(1)
+    # Get the context around the most relevant chunk
+    start_index = max(0, most_relevant_chunk_index * 40 - context_size // len(' '.join(words)) * 40)
+    end_index = min(len(words), (most_relevant_chunk_index + 1) * 40 + context_size // len(' '.join(words)) * 40)
 
-    print("Ingesting PDFs and creating index... This may take a while.")
-    index = await ingest_pdfs(pdf_directory)
-    print("Index created successfully!")
+    relevant_text = ' '.join(words[start_index:end_index])
 
-    while True:
-        query = input("\nEnter your query (or 'quit' to exit): ")
-        if query.lower() == 'quit':
-            break
+    # Highlight the query terms
+    highlighted_text = re.sub(f'({"|".join(re.escape(term) for term in query.split())})', r'**\1**', relevant_text, flags=re.IGNORECASE)
 
-        result = await query_index(index, query)
-        print("\nResult:")
-        print(result)
+    return highlighted_text
 
-    print("Thank you for using the RAG-based Tabular PDF Ingestion Application!")
+async def query_index(index: VectorStoreIndex, query: str) -> Dict:
+    retriever = index.as_retriever(similarity_top_k=3)
+    nodes = retriever.retrieve(query)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    results = []
+    sources = []
+    for node in nodes:
+        relevant_chunk = get_most_relevant_chunk_with_context(node.text, query)
+        results.append(relevant_chunk)
+        sources.append(node.metadata.get("source", "Unknown"))
+
+    return {
+        "results": results,
+        "sources": sources
+    }

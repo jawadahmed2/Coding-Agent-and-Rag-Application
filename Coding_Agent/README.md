@@ -31,3 +31,8 @@ The agent will listen for webhook events and perform the following actions:
 - Generate code based on predefined prompts
 - Test the generated code
 - Push the code to the dummy repository
+
+## Testing the application
+
+- You can test the application by visiting this url: <http://0.0.0.0:8000/docs>
+- Enter the payload and execute
